@@ -41,7 +41,8 @@ Figure 1.2 __External__ - multi master where `etcd` cluster  running outside of 
 | HA nodes workload reduction     |               | No           | Yes           |
 | Etcd Security                   |               |              | Higher        |
 
-The stacked solution looks more optimal in terms of HA, complexity and resource vise. For External etcd solution should be special business case 
+>The stacked solution looks more optimal in terms of HA, complexity and resource vise. For External etcd solution should be special business case 
+{.is-info}
 
 # Prerequisites 
 
