@@ -525,6 +525,13 @@ by adding
 10.0.1.190   etcd3        
 ```
 
+### set Hostname 
+
+according to /etc/hosts file it is's not set 
+
+`sudo hostnamectl set-hostname master1`
+...
+
 ### Start init 
 
 create config on master1 node 
@@ -817,6 +824,45 @@ worker1   Ready    <none>   101s   v1.19.3
 worker2   Ready    <none>   62s    v1.19.3
 worker3   Ready    <none>   35s    v1.19.3
 ```
+### Metrics-Server
+Metrics Server collects resource metrics from Kubelets and exposes them in Kubernetes apiserver through Metrics API for use by Horizontal Pod Autoscaler and Vertical Pod Autoscaler.
+
+>to deploy metrics server in K8s HA require to enable ` - --enable-aggregator-routing=true`
+>in to API server manifest file on every node. `/etc/kubernetes/manifests/kube-apiserver.yaml`
+
+- in metrics YAML set args 
+```buildoutcfg
+        args:
+          - --metric-resolution=30s
+          - --kubelet-insecure-tls
+          - --kubelet-preferred-address-types=InternalIP
+          - --cert-dir=/tmp
+          - --secure-port=4443
+```
+- and apply metrics server YAML 
+```buildoutcfg
+ubuntu@master1:~$ kubectl create -f metrics-server0.3.7.yml 
+clusterrole.rbac.authorization.k8s.io/system:aggregated-metrics-reader created
+clusterrolebinding.rbac.authorization.k8s.io/metrics-server:system:auth-delegator created
+rolebinding.rbac.authorization.k8s.io/metrics-server-auth-reader created
+Warning: apiregistration.k8s.io/v1beta1 APIService is deprecated in v1.19+, unavailable in v1.22+; use apiregistration.k8s.io/v1 APIService
+apiservice.apiregistration.k8s.io/v1beta1.metrics.k8s.io created
+serviceaccount/metrics-server created
+deployment.apps/metrics-server created
+service/metrics-server created
+clusterrole.rbac.authorization.k8s.io/system:metrics-server created
+clusterrolebinding.rbac.authorization.k8s.io/system:metrics-server created
+ubuntu@master1:~$ 
+
+```
+- check resource consumption by top command 
+```
+ubuntu@master1:~$ kubectl top nodes
+Error from server (ServiceUnavailable): the server is currently unable to handle the request (get nodes.metrics.k8s.io)
+```
+> This looks like a [Bug](https://github.com/kubernetes-sigs/metrics-server/labels/kind%2Fbug) in 19.3   
+>_Require investigation_ 
+
 ## ETCD members check 
 
 ```buildoutcfg
@@ -830,3 +876,64 @@ ubuntu@master1:~$ sudo etcdctl --endpoints="https://10.0.1.176:2379" member list
 +------------------+---------+---------+-------------------------+-------------------------+------------+
 
 ```
+
+## Testing Stacked etcd
+
+__Test1:__ Cluster healthy. x1 nginx pod running. x3 CP etcd master nodes in RAFT. Run `watch kubectl get pods -o wide` every 2 seconds .
+Perform hard shutdown from AWS console for master2 node. Scale up nginx up to 5 replicas, deploy busybox. bring back master2  
+__Expected:__ No impact to API, node Down/UP not make any influence to cluster health, cluster replicated.
+
+- taking hard down master2
+- scaling up nginx to 5 rs
+- new busybox deployment 
+
+```buildoutcfg
+Every 2.0s: kubectl get pods -o wide                                                                                                            master1: Wed Oct 28 21:04:59 2020
+
+NAME                                READY   STATUS    RESTARTS   AGE   IP              NODE      NOMINATED NODE   READINESS GATES
+busybox1                            1/1     Running   0          23s   10.12.217.197   worker2   <none>           <none>
+nginx-deployment-66b6c48dd5-8pz7n   1/1     Running   0          91m   10.12.217.196   worker2   <none>           <none>
+nginx-deployment-66b6c48dd5-jkvbz   1/1     Running   0          13m   10.12.221.5     worker3   <none>           <none>
+nginx-deployment-66b6c48dd5-lfbx6   1/1     Running   0          13m   10.12.219.134   worker1   <none>           <none>
+nginx-deployment-66b6c48dd5-rzdbw   1/1     Running   0          13m   10.12.219.135   worker1   <none>           <none>
+nginx-deployment-66b6c48dd5-tbf8c   1/1     Running   0          13m   10.12.221.4     worker3   <none>           <none>
+```  
+- node master2 is NotReady
+
+ubuntu@master1:~$ kubectl get nodes
+NAME      STATUS     ROLES    AGE   VERSION
+master1   Ready      master   23h   v1.19.3
+master2   NotReady   master   22h   v1.19.3
+master3   Ready      master   22h   v1.19.3
+worker1   Ready      <none>   22h   v1.19.3
+worker2   Ready      <none>   22h   v1.19.3
+worker3   Ready      <none>   22h   v1.19.3
+
+>__Result:__ There was about 30 seconds gap/blip in `watch` pulling. Noted 30 seconds is health check interval in AWS load balancer target group health checks. Once time-outed no blips visible by joining back cluster.
+>  
+```
+ab@ZNATA:~ $ aws elbv2 describe-target-groups --target-group-arns arn:aws:elasticloadbalancing:eu-central-1:104671021050:targetgroup/eu-reg1-vpc1-tgrp1/5493add7a0e9a62e
+--------------------------------------------------------------------------------------------------------------------------------------------
+|                                                           DescribeTargetGroups                                                           |
++------------------------------------------------------------------------------------------------------------------------------------------+
+||                                                              TargetGroups                                                              ||
+|+----------------------------+-----------------------------------------------------------------------------------------------------------+|
+||  HealthCheckEnabled        |  True                                                                                                     ||
+||  HealthCheckIntervalSeconds|  30                                                                                                       ||
+||  HealthCheckPort           |  traffic-port                                                                                             ||
+||  HealthCheckProtocol       |  TCP                                                                                                      ||
+||  HealthCheckTimeoutSeconds |  10                                                                                                       ||
+||  HealthyThresholdCount     |  3                                                                                                        ||
+||  Port                      |  6443                                                                                                     ||
+||  Protocol                  |  TCP                                                                                                      ||
+||  TargetGroupArn            |  arn:aws:elasticloadbalancing:eu-central-1:104671021050:targetgroup/eu-reg1-vpc1-tgrp1/5493add7a0e9a62e   ||
+||  TargetGroupName           |  eu-reg1-vpc1-tgrp1                                                                                       ||
+||  TargetType                |  ip                                                                                                       ||
+||  UnhealthyThresholdCount   |  3                                                                                                        ||
+||  VpcId                     |  vpc-0258f15c8f72dbb78                                                                                    ||
+|+----------------------------+-----------------------------------------------------------------------------------------------------------+|
+|||                                                           LoadBalancerArns                                                           |||
+||+--------------------------------------------------------------------------------------------------------------------------------------+||
+|||  arn:aws:elasticloadbalancing:eu-central-1:104671021050:loadbalancer/net/eu-reg1-vpc1-lb1/810156c505df9163                           |||
+||+--------------------------------------------------------------------------------------------------------------------------------------+||
+```    
