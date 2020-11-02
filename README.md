@@ -937,3 +937,357 @@ ab@ZNATA:~ $ aws elbv2 describe-target-groups --target-group-arns arn:aws:elasti
 |||  arn:aws:elasticloadbalancing:eu-central-1:104671021050:loadbalancer/net/eu-reg1-vpc1-lb1/810156c505df9163                           |||
 ||+--------------------------------------------------------------------------------------------------------------------------------------+||
 ```    
+
+# External etcd solution deployment
+
+- ensure pre-requisites are met
+- be aware of docker cgroup driver in use (same should be set in kubelet)
+
+## Setup ETCD external nodes
+
+Configure the kubelet to be a service manager for etcd
+
+```buildoutcfg
+ubuntu@etcd3:~$ sudo -i
+root@etcd3:~# systemctl daemon-reload
+root@etcd3:~# cat << EOF > /etc/systemd/system/kubelet.service.d/20-etcd-service-manager.conf
+> [Service]
+> ExecStart=
+> #  Replace "systemd" with the cgroup driver of your container runtime. The default value in the kubelet is "cgroupfs".
+> ExecStart=/usr/bin/kubelet --address=127.0.0.1 --pod-manifest-path=/etc/kubernetes/manifests --cgroup-driver=systemd
+> Restart=always
+> EOF
+root@etcd3:~# systemctl daemon-reload
+root@etcd3:~# systemctl restart kubelet
+
+```
+>Note: You must do this on every host where etcd should be running. 
+
+##Create configuration files for `kubeadm`
+
+Generate one kubeadm configuration file for each host that will have an etcd member running on i
+
+> NOTE: Run these commands on etcd1 - $HOST0 (where we generated the configuration files for kubeadm)
+
+```
+export HOST0=10.0.1.35
+export HOST1=10.0.1.98
+export HOST2=10.0.1.190
+```
+
+create bash script and run it on etcd1 
+
+```buildoutcfg
+ETCDHOSTS=(${HOST0} ${HOST1} ${HOST2})
+NAMES=("etcd1" "etcd2" "etcd3")
+
+for i in "${!ETCDHOSTS[@]}"; do
+HOST=${ETCDHOSTS[$i]}
+NAME=${NAMES[$i]}
+cat << EOF > /tmp/${HOST}/kubeadmcfg.yaml
+apiVersion: "kubeadm.k8s.io/v1beta2"
+kind: ClusterConfiguration
+etcd:
+    local:
+        serverCertSANs:
+        - "${HOST}"
+        peerCertSANs:
+        - "${HOST}"
+        extraArgs:
+            initial-cluster: ${NAMES[0]}=https://${ETCDHOSTS[0]}:2380,${NAMES[1]}=https://${ETCDHOSTS[1]}:2380,${NAMES[2]}=https://${ETCDHOSTS[2]}:2380
+            initial-cluster-state: new
+            name: ${NAME}
+            listen-peer-urls: https://${HOST}:2380
+            listen-client-urls: https://${HOST}:2379
+            advertise-client-urls: https://${HOST}:2379
+            initial-advertise-peer-urls: https://${HOST}:2380
+EOF
+done
+```
+## Generate the Certificate Authority
+
+```buildoutcfg
+kubeadm init phase certs etcd-ca
+```
+> NOTE: all on etcd1 node 
+
+This command creates these two files:
+
+`/etc/kubernetes/pki/etcd/ca.crt`
+`/etc/kubernetes/pki/etcd/ca.key`
+ 
+ 
+##Create certificates for each etcd member
+
+run bash script on etcd1
+
+ ```buildoutcfg
+kubeadm init phase certs etcd-server --config=/tmp/${HOST2}/kubeadmcfg.yaml
+kubeadm init phase certs etcd-peer --config=/tmp/${HOST2}/kubeadmcfg.yaml
+kubeadm init phase certs etcd-healthcheck-client --config=/tmp/${HOST2}/kubeadmcfg.yaml
+kubeadm init phase certs apiserver-etcd-client --config=/tmp/${HOST2}/kubeadmcfg.yaml
+cp -R /etc/kubernetes/pki /tmp/${HOST2}/
+
+# Cleanup non-reusable certificates
+find /etc/kubernetes/pki -not -name ca.crt -not -name ca.key -type f -delete
+
+kubeadm init phase certs etcd-server --config=/tmp/${HOST1}/kubeadmcfg.yaml
+kubeadm init phase certs etcd-peer --config=/tmp/${HOST1}/kubeadmcfg.yaml
+kubeadm init phase certs etcd-healthcheck-client --config=/tmp/${HOST1}/kubeadmcfg.yaml
+kubeadm init phase certs apiserver-etcd-client --config=/tmp/${HOST1}/kubeadmcfg.yaml
+cp -R /etc/kubernetes/pki /tmp/${HOST1}/
+
+# Cleanup non-reusable certificates
+find /etc/kubernetes/pki -not -name ca.crt -not -name ca.key -type f -delete
+
+kubeadm init phase certs etcd-server --config=/tmp/${HOST0}/kubeadmcfg.yaml
+kubeadm init phase certs etcd-peer --config=/tmp/${HOST0}/kubeadmcfg.yaml
+kubeadm init phase certs etcd-healthcheck-client --config=/tmp/${HOST0}/kubeadmcfg.yaml
+kubeadm init phase certs apiserver-etcd-client --config=/tmp/${HOST0}/kubeadmcfg.yaml
+
+# No need to move the certs because they are for HOST0
+
+# Clean up certs that should not be copied off this host
+find /tmp/${HOST2} -name ca.key -type f -delete
+find /tmp/${HOST1} -name ca.key -type f -delete
+```
+
+## Copy certificates and kubeadm configs 
+
+copy certificates and kubeadm configs  to other etcd members etcd2 and etcd3
+
+```
+ # etcd2
+USER=ubuntu
+HOST=${HOST1}
+scp -i etcd12.pem -r /tmp/${HOST}/* ${USER}@${HOST}:
+ssh -i etcd12.pem ${USER}@${HOST}
+USER@HOST $ sudo -Es
+root@HOST $ chown -R root:root pki
+root@HOST $ mv pki /etc/kubernetes/
+
+# etcd3
+USER=ubuntu
+HOST=${HOST2}
+scp -i etcd12.pem -r /tmp/${HOST}/* ${USER}@${HOST}:
+ssh -i etcd12.pem ${USER}@${HOST}
+USER@HOST $ sudo -Es
+root@HOST $ chown -R root:root pki
+root@HOST $ mv pki /etc/kubernetes/
+```
+
+## Ensure that on every etcd node files exist
+
+like below should be on etcd1 , etcd2 and etcd3 
+
+```buildoutcfg
+root@etcd3:~# tree /etc/kubernetes/pki/
+/etc/kubernetes/pki/
+├── apiserver-etcd-client.crt
+├── apiserver-etcd-client.key
+└── etcd
+    ├── ca.crt
+    ├── healthcheck-client.crt
+    ├── healthcheck-client.key
+    ├── peer.crt
+    ├── peer.key
+    ├── server.crt
+    └── server.key
+
+1 directory, 9 files
+root@etcd3:~# tree ~
+/home/ubuntu
+└── kubeadmcfg.yaml
+
+0 directories, 1 file
+root@etcd3:~#
+```
+
+##Create the static pod manifests
+
+on every node 
+
+```buildoutcfg
+root@etcd1 $ kubeadm init phase etcd local --config=/tmp/${HOST0}/kubeadmcfg.yaml
+root@etcd2 $ kubeadm init phase etcd local --config=/home/ubuntu/kubeadmcfg.yaml
+root@etcd3 $ kubeadm init phase etcd local --config=/home/ubuntu/kubeadmcfg.yaml
+```
+Output: 
+
+`[etcd] Creating static Pod manifest for local etcd in "/etc/kubernetes/manifests"`
+
+## Check etcd cluster health 
+```
+root@etcd1:~# ./etcdctl --endpoints="https://10.0.1.190:2379" endpoint health --cluster --write-out=table --cacert /etc/kubernetes/pki/etcd/ca.crt --cert /etc/kubernetes/pki/etcd/server.crt --key /etc/kubernetes/pki/etcd/server.key
++-------------------------+--------+-------------+-------+
+|        ENDPOINT         | HEALTH |    TOOK     | ERROR |
++-------------------------+--------+-------------+-------+
+| https://10.0.1.190:2379 |   true | 11.092884ms |       |
+|  https://10.0.1.35:2379 |   true | 13.555545ms |       |
+|  https://10.0.1.98:2379 |   true | 15.752259ms |       |
++-------------------------+--------+-------------+-------+
+```
+## Setup 1st CP master1 node with external etcd cluster
+
+Copy the following files from any etcd node to the first control plane node
+```buildoutcfg
+export CONTROL_PLANE1="ubuntu@10.0.1.176"
+ssh -i etcd12.prem ${CONTROL_PLANE1}
+mkdir -p /etc/kubernetes/pki/etcd/
+
+
+# Exit ssh and copy files from $HOST0
+scp -i etcd12.prem /etc/kubernetes/pki/etcd/ca.crt "${CONTROL_PLANE1}":/etc/kubernetes/pki/etcd/ca.crt
+scp -i etcd12.prem  /etc/kubernetes/pki/apiserver-etcd-client.crt "${CONTROL_PLANE1}":/etc/kubernetes/pki/apiserver-etcd-client.crt
+scp -i etcd12.prem  /etc/kubernetes/pki/apiserver-etcd-client.key "${CONTROL_PLANE1}":/etc/kubernetes/pki/apiserver-etcd-client.crt
+```
+
+- edit the `/etc/kubernetes/kubeadm/kubeadm-config.yaml` that created in stacked example and add etcd cluster info 
+
+
+```buildoutcfg
+root@master1:~# cat /etc/kubernetes/kubeadm/kubeadm-config.yaml 
+apiVersion: kubeadm.k8s.io/v1beta1
+kind: ClusterConfiguration
+kubernetesVersion: stable
+controlPlaneEndpoint: "eu-reg1-vpc1-lb1-810156c505df9163.elb.eu-central-1.amazonaws.com:6443"
+networking:
+  podSubnet: 10.12.208.0/20
+etcd:
+    external:
+        endpoints:
+        - https://10.0.1.35:2379
+        - https://10.0.1.98:2379
+        - https://10.0.1.190:2379
+        caFile: /etc/kubernetes/pki/etcd/ca.crt
+        certFile: /etc/kubernetes/pki/apiserver-etcd-client.crt
+        keyFile: /etc/kubernetes/pki/apiserver-etcd-client.key
+
+```
+- run init on master1 node 
+
+`sudo kubeadm init --node-name master1  --config=/etc/kubernetes/kubeadm/kubeadm-config.yaml --upload-certs`
+
+<details>
+    <summary>Cluster init</summary>
+    ### master1 node:
+
+```buildoutcfg
+root@master1:~# kubeadm init --node-name master1  --config=/etc/kubernetes/kubeadm/kubeadm-config.yaml --upload-certs     
+W1102 19:09:43.714784 3967066 common.go:77] your configuration file uses a deprecated API spec: "kubeadm.k8s.io/v1beta1". Please use 'kubeadm config migrate --old-config old.yaml --new-config new.yaml', which will write the new, similar spec using a newer API version.
+W1102 19:09:44.142852 3967066 configset.go:348] WARNING: kubeadm cannot validate component configs for API groups [kubelet.config.k8s.io kubeproxy.config.k8s.io]
+[init] Using Kubernetes version: v1.19.3
+[preflight] Running pre-flight checks
+[preflight] Pulling images required for setting up a Kubernetes cluster
+[preflight] This might take a minute or two, depending on the speed of your internet connection
+[preflight] You can also perform this action in beforehand using 'kubeadm config images pull'
+[certs] Using certificateDir folder "/etc/kubernetes/pki"
+[certs] Generating "ca" certificate and key
+[certs] Generating "apiserver" certificate and key
+[certs] apiserver serving cert is signed for DNS names [eu-reg1-vpc1-lb1-810156c505df9163.elb.eu-central-1.amazonaws.com kubernetes kubernetes.default kubernetes.default.svc kubernetes.default.svc.cluster.local master1] and IPs [10.96.0.1 10.0.1.176]
+[certs] Generating "apiserver-kubelet-client" certificate and key
+[certs] Generating "front-proxy-ca" certificate and key
+[certs] Generating "front-proxy-client" certificate and key
+[certs] External etcd mode: Skipping etcd/ca certificate authority generation
+[certs] External etcd mode: Skipping etcd/server certificate generation
+[certs] External etcd mode: Skipping etcd/peer certificate generation
+[certs] External etcd mode: Skipping etcd/healthcheck-client certificate generation
+[certs] External etcd mode: Skipping apiserver-etcd-client certificate generation
+[certs] Generating "sa" key and public key
+[kubeconfig] Using kubeconfig folder "/etc/kubernetes"
+[kubeconfig] Writing "admin.conf" kubeconfig file
+[kubeconfig] Writing "kubelet.conf" kubeconfig file
+[kubeconfig] Writing "controller-manager.conf" kubeconfig file
+[kubeconfig] Writing "scheduler.conf" kubeconfig file
+[kubelet-start] Writing kubelet environment file with flags to file "/var/lib/kubelet/kubeadm-flags.env"
+[kubelet-start] Writing kubelet configuration to file "/var/lib/kubelet/config.yaml"
+[kubelet-start] Starting the kubelet
+[control-plane] Using manifest folder "/etc/kubernetes/manifests"
+[control-plane] Creating static Pod manifest for "kube-apiserver"
+[control-plane] Creating static Pod manifest for "kube-controller-manager"
+[control-plane] Creating static Pod manifest for "kube-scheduler"
+[wait-control-plane] Waiting for the kubelet to boot up the control plane as static Pods from directory "/etc/kubernetes/manifests". This can take up to 4m0s
+[apiclient] All control plane components are healthy after 10.010319 seconds
+[upload-config] Storing the configuration used in ConfigMap "kubeadm-config" in the "kube-system" Namespace
+[kubelet] Creating a ConfigMap "kubelet-config-1.19" in namespace kube-system with the configuration for the kubelets in the cluster
+[upload-certs] Storing the certificates in Secret "kubeadm-certs" in the "kube-system" Namespace
+[upload-certs] Using certificate key:
+4f42f2ed9038a717da85bca90eada03aee24703c70403939601be0f829a068b4
+[mark-control-plane] Marking the node master1 as control-plane by adding the label "node-role.kubernetes.io/master=''"
+[mark-control-plane] Marking the node master1 as control-plane by adding the taints [node-role.kubernetes.io/master:NoSchedule]
+[bootstrap-token] Using token: wxinhq.ykmmfxetzk3qepd0
+[bootstrap-token] Configuring bootstrap tokens, cluster-info ConfigMap, RBAC Roles
+[bootstrap-token] configured RBAC rules to allow Node Bootstrap tokens to get nodes
+[bootstrap-token] configured RBAC rules to allow Node Bootstrap tokens to post CSRs in order for nodes to get long term certificate credentials
+[bootstrap-token] configured RBAC rules to allow the csrapprover controller automatically approve CSRs from a Node Bootstrap Token
+[bootstrap-token] configured RBAC rules to allow certificate rotation for all node client certificates in the cluster
+[bootstrap-token] Creating the "cluster-info" ConfigMap in the "kube-public" namespace
+[kubelet-finalize] Updating "/etc/kubernetes/kubelet.conf" to point to a rotatable kubelet client certificate and key
+[addons] Applied essential addon: CoreDNS
+[addons] Applied essential addon: kube-proxy
+
+Your Kubernetes control-plane has initialized successfully!
+
+To start using your cluster, you need to run the following as a regular user:
+
+  mkdir -p $HOME/.kube
+  sudo cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
+  sudo chown $(id -u):$(id -g) $HOME/.kube/config
+
+You should now deploy a pod network to the cluster.
+Run "kubectl apply -f [podnetwork].yaml" with one of the options listed at:
+  https://kubernetes.io/docs/concepts/cluster-administration/addons/
+
+You can now join any number of the control-plane node running the following command on each as root:
+
+  kubeadm join eu-reg1-vpc1-lb1-810156c505df9163.elb.eu-central-1.amazonaws.com:6443 --token wxinhq.ykmmfxetzk3qepd0 \
+    --discovery-token-ca-cert-hash sha256:409966c18c12ea048ee0a1ca13f4a072bf3433c104a8c0e8e56b1fd5109f2bc1 \
+    --control-plane --certificate-key 4f42f2ed9038a717da85bca90eada03aee24703c70403939601be0f829a068b4
+
+Please note that the certificate-key gives access to cluster sensitive data, keep it secret!
+As a safeguard, uploaded-certs will be deleted in two hours; If necessary, you can use
+"kubeadm init phase upload-certs --upload-certs" to reload certs afterward.
+
+Then you can join any number of worker nodes by running the following on each as root:
+
+kubeadm join eu-reg1-vpc1-lb1-810156c505df9163.elb.eu-central-1.amazonaws.com:6443 --token wxinhq.ykmmfxetzk3qepd0 \
+    --discovery-token-ca-cert-hash sha256:409966c18c12ea048ee0a1ca13f4a072bf3433c104a8c0e8e56b1fd5109f2bc1 
+
+```
+</details>
+
+- deploy calico and check kubernetes  cluster status
+
+```buildoutcfg
+ubuntu@master1:~$ kubectl get pods -n kube-system
+NAME                                     READY   STATUS    RESTARTS   AGE
+calico-kube-controllers-7d569d95-vbph7   1/1     Running   0          3m34s
+calico-node-4sbgt                        0/1     Running   0          3m34s
+calico-node-8rf8r                        0/1     Running   0          3m34s
+calico-node-m8qp2                        0/1     Running   0          3m34s
+calico-node-ml4mb                        0/1     Running   0          3m34s
+calico-node-rn4qm                        0/1     Running   0          3m34s
+calico-node-zkgxp                        0/1     Running   0          3m34s
+coredns-f9fd979d6-p59xk                  1/1     Running   0          21m
+coredns-f9fd979d6-xbjwt                  1/1     Running   0          21m
+kube-apiserver-master1                   1/1     Running   0          21m
+kube-apiserver-master2                   1/1     Running   0          19m
+kube-apiserver-master3                   1/1     Running   0          18m
+kube-controller-manager-master1          1/1     Running   0          21m
+kube-controller-manager-master2          1/1     Running   0          19m
+kube-controller-manager-master3          1/1     Running   0          18m
+kube-proxy-4wn7v                         1/1     Running   0          18m
+kube-proxy-5654p                         1/1     Running   0          19m
+kube-proxy-9k62n                         1/1     Running   0          21m
+kube-proxy-lk4zd                         1/1     Running   0          9m30s
+kube-proxy-lmp52                         1/1     Running   0          18m
+kube-proxy-mkjb8                         1/1     Running   0          18m
+kube-scheduler-master1                   1/1     Running   0          21m
+kube-scheduler-master2                   1/1     Running   0          19m
+kube-scheduler-master3                   1/1     Running   0          18m
+metrics-server-7d68cbc8df-xcb26          1/1     Running   0          114s
+```
+
+as we see etcd running outside of the kubernetes cluster
+
+
